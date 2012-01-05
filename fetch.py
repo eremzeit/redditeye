@@ -1,8 +1,15 @@
+import time
+import random
 from datetime import datetime
-from pymongo.objectid import ObjectID
-from mongokit import *
-import redditapi as reddit
+from datetime import timedelta
+from pdb import set_trace as bp
 
+import pymongo
+from pymongo import Connection
+import pdb
+pdb.set_trace()
+
+import lib.reddit as reddit
 
 """
 3. During an update of the list of tracked submissions:
@@ -15,8 +22,6 @@ import redditapi as reddit
 
 """
 -=Update Loop Pseudocode=-
-
-
 MIN_TRACKING_TIME = timespan(24,0,0)
 tracked_submissions = get_tracked_submissions(subreddit)
 last_context_update = datetime.now()
@@ -33,15 +38,267 @@ for sub in tracked_submissions:
             sub.tracking = false
             sub.save()
 """
+
+
 #init mongoDB
 dbname = 'redditeye'
 conn = Connection()
 db = conn[dbname]
 
-#init redditapi
+db.drop_collection('Trials')
+db.drop_collection('SubmissionDatums')
+db.drop_collection('SubReddits')
 
 
-import random
+class RedditTrial:
+    def Init(self, subreddit_name, db, 
+                    min_submission_tracking_time,
+                    reddit_request_interval,
+                    max_submission_age_for_start_tracking):
+        
+        self.db = db
+        self.subreddit_name = subreddit_name
+        self.reddit = reddit.Reddit('REDDITEYE -- version alpha')
+
+        self.subreddit = self.reddit.get_subreddit(subreddit_name)
+        log('subreddit retrieved...')
+        self.min_submission_tracking_time = min_submission_tracking_time
+        self.reddit_request_interval = reddit_request_interval
+        self.max_submission_age_for_start_tracking = max_submission_age_for_start_tracking
+
+        self.timer = MinRequestTime(timedelta(0,30))  #one minute
+        #self.timer = MinRequestTime(timedelta(0,60))  #one minute
+
+class MultipleSubmissionTrial(RedditTrial):
+    _NUM_SUBMISSIONS_TO_FETCH = 50
+    
+    def __init__(self, subreddit_name, db, 
+                    min_submission_tracking_time=timedelta(0,2*60*60),
+                    reddit_request_interval=timedelta(0, 10*60),
+                    max_submission_age_for_start_tracking=timedelta(0, 60*60),
+                    tracked_submissions_limit=10):
+
+        self.Init(subreddit_name, db, min_submission_tracking_time, reddit_request_interval, max_submission_age_for_start_tracking)
+        self.tracked_submissions_limit = tracked_submissions_limit
+        
+        self._init_trial()
+        self._refresh_subreddit()
+        self._choose_tracked_submissions()
+        
+        self.start_loop()
+
+    def _refresh_trial(self):
+        self.trial = db.Trials.find_one({'_id' : self.trial_oid})
+
+    def _start_tracking_submission(self, r_submission):
+        #not sure why but each time we're getting different types for r_sub.author
+        if type(r_sub.author) == unicode:
+            name = r_sub.author
+        else:
+            name = r_sub.author.name
+        
+        s = {
+            'r_content_id' : r_sub.content_id,
+            'r_id' : r_sub.id,
+            'author' : name,
+            'title' : r_sub.title,
+            'selftext' : r_sub.selftext,
+            'submission_date' : datetime.fromtimestamp(r_sub.created),
+            'submission_date_utc' : datetime.fromtimestamp(r_sub.created_utc),
+            'subreddit_name' : self.r_subreddit.title,
+            'tracking' : True,
+            'tracking_start_date' : datetime.now(),
+            'url' : r_sub.url,
+            'is_self' : r_sub.is_self
+        } 
+        
+        #self._refresh_trial()
+        db.Trials.update({'_id' : self.trial_oid}, {'$push' : {'submissions': s}})
+        db.save()
+
+        return s
+
+
+    def _stop_tracking_submission(self, content_id):
+        db.Trials.update({'_id' : self.trial_oid}, {'$pull' : {'submissions' : {'r_content_id': content_id}}})
+
+
+    def _refresh_subreddit(self):
+        self.r_subreddit = self.reddit.get_subreddit(self.subreddit_name)
+        sr = db.SubReddits.find_one({'name':self.subreddit_name})
+        if sr:
+            self.subreddit = sr
+        else: 
+            sr = {'name':self.subreddit_name, 'url':self.r_subreddit.url, 'subscribers':self.r_subreddit.subscribers}
+            db.SubReddits.insert(sr)
+            self.subreddit = sr
+    
+    def _select_tracked_submissions(self):
+        self._refresh_trial()
+        _submissions = self.trial['submissions']
+        
+        subs = [] + _submissions
+        if len(submissions) >= self.self.tracked_submissions_limit:
+            return
+
+        new_subs = self.r_subreddit.get_new()
+        for r_sub in new_subs:
+            created_on = datetime.fromtimestamp(r_sub.created)
+            if datetime.now() - created_on < self.max_submission_age_for_start_tracking:
+                log('tracking submission: %s' % r_sub.title)
+                sub = self._start_tracking_submission(r_sub)
+                subs.append(sub)
+                if len(subs) >= self.tracked_submissions_limit:
+                    break
+    
+    def _init_trial(self):
+        t = {
+            'startdate' : datetime.now(),
+            'finishdate' : None,
+            'min_submission_track_seconds' : flatten_to_seconds(self.min_submission_tracking_time),
+        }
+
+        self.trial_oid = db.Trials.insert(t)
+        self.trial = t
+
+    #
+    # MAIN LOOP
+    #
+    def start_loop(self):
+        self.tracked_submissions = self._get_tracked_submissions()
+        log('Starting monitoring.')
+         
+        #main fetching loop (continue until not tracking any submissions)
+        while self.tracked_submissions:
+            self._select_tracked_submissions()
+            self.reset_subreddit()
+
+            log('fetching update at %s...' % str(datetime.now()))
+            self._process_submissions()
+            
+            self.tracked_submissions = self._get_tracked_submissions()
+            self.timer.Wait()
+        print 'DONE!'
+   
+    def _process_comments(self):
+        for sub in self.tracked_submissions:
+            if not sub['tracking_comments']: continue
+            
+            for r_comment in sub.all_comments:
+                comment = make_comment_datum(self, r_sub, r_comment)
+
+    def _process_submissions(self):
+        _limit = self._NUM_SUBMISSIONS_TO_FETCH
+        top_rsubs = list(self.r_subreddit.get_top(limit=_limit))
+        hot_rsubs = list(self.r_subreddit.get_hot(limit=_limit))
+        new_rsubs = list(self.r_subreddit.get_new(limit=_limit))
+        
+        for sub in self.tracked_submissions:
+            log('processing submission: %s' % sub['title'])
+            if not sub['tracking']: continue
+            top_pos, hot_pos, new_pos = -1, -1, -1
+            match = lambda rsub: rsub.content_id == sub['r_content_id']
+            _top_rsubs = filter(match, top_rsubs)
+            _hot_rsubs = filter(match, hot_rsubs)
+            _new_rsubs = filter(match, new_rsubs)
+
+            rsub = None 
+            if _top_rsubs or _hot_rsubs or _new_rsubs:
+                _rsubs = _top_rsubs + _hot_rsubs + _new_rsubs
+                rsub = _rsubs[0]
+            else:
+                #fix this to update via mongoDB
+                db.Trials.update(
+                    {'submissions.r_content_id' : sub['r_content_id'], '_id': self.trial['_id'] }, 
+                    { '$set' : {'submissions.$.tracking': False, 'submissions.$.tracking_comments' : False}})
+                rsub = self.reddit.get_submission(submission_id=sub['r_id'])
+
+            if _top_rsubs:
+                top_pos = top_rsubs.index(_top_rsubs[0])
+            
+            if _hot_rsubs:
+                hot_pos = hot_rsubs.index(_hot_rsubs[0])
+            
+            if _new_rsubs:
+                new_pos = new_rsubs.index(_new_rsubs[0])
+
+            self.make_submission_datum(rsub, hot_pos, top_pos, new_pos)
+
+    def _get_tracked_submissions(self):
+        self._refresh_trial()
+        subs = self.trial['submissions']
+        return filter(lambda sub: sub['tracking'] or sub['tracking_comments'], subs)
+
+    def make_submission_datum(self, r_sub, position_hot, position_top, position_new):
+        sub_datum = {
+            'comment_count' : r_sub.num_comments,
+            'upvotes' : r_sub.ups,
+            'downvotes' : r_sub.downs,
+            'score' : r_sub.score,
+            'r_content_id' : r_sub.content_id,
+            'id' : r_sub.id,
+            'fetch_date' : datetime.now(),
+            'position_hot' : position_hot,
+            'position_top' : position_top,
+            'position_new' : position_new,
+        }
+        
+        self.db.SubmissionDatums.insert(sub_datum)
+        return sub_datum 
+    
+    def make_comment_datum(self, r_sub, r_comment):
+        #if comment document doesn't already exist in db, create it
+        comments = self.db.Comments.find({'r_content_id':r_comment.content_id})
+        if comments:
+            comment = comments[0]
+        else:
+            comment = self.db.Comment()
+            comment.r_content_id = r_comment.content_id
+            comment.r_sub_cid = r_sub.content_id
+            comment.author = r_comment.author
+            comment.r_parent_id = r_comment.parent_id
+            comment.created = r_comment.created
+            comment.created_utc = r_comment.created_utc
+            comment.save()
+
+        #make the comment datum
+        cdatum = db.CommentDatum()
+        cdatum.comment_oid
+        cdatum.fetch_date = datetime.now()
+        cdatum.upvotes = r_comment.upvotes
+        cdatum.downvotes = r_comment.downvotes
+        return cdatum
+    
+def output_submission_datums(datums):
+    time_zero = datums[0]['fetch_date']
+
+    print ''
+    for datum in datums:
+        minutes = (datum['fetch_date'] - time_zero).seconds / 60.0
+        row = [ minutes, datum['position_hot'], datum['position_new'], datum['position_top'], 
+                datum['comment_count'], datum['score'], datum['upvotes'], datum['downvotes']]
+        row = map(lambda i: str(i), row)
+        print ', '.join(row)
+
+        #'submission_oid' : ObjectId,
+        #'r_content_id': unicode,
+        #'comment_count' : int,
+        #'upvotes' : int,
+        #'downvotes' : int,
+        #'score' : int,
+        #'fetch_date' : datetime,
+        #'position_hot' : int,
+        #'position_new' : int,
+        #'position_top' : int,
+
+class MinRequestTime():
+    def __init__(self, time):
+       self.minTime = time
+
+    def Wait (self):
+        print '.'
+        time.sleep(self.minTime.seconds)
+
 class SubmissionSortTypes:
     HOT = u'hot'
     NEW = u'new'
@@ -60,308 +317,30 @@ class CommentSortTypes:
     @staticmethod
     def get_list():
         return [CommentSortTypes.BEST , CommentSortTypes.HOT ,CommentSortTypes.NEW ,CommentSortTypes.TOP]
-
-
-
-class MultipleSubmissionTrial(object):
-    _MIN_SUBMISSION_TRACKING_TIME = timespan(24,0,0)
-    _REDDIT_REQUEST_INTERVAL = timespan(0,0,4)
-
-
-    def __init__(self, subreddit_name, db, 
-                    min_submission_tracking_time=timedelta(0,2*60*60),
-                    reddit_request_interval=timedelta(0, 10*60),
-                    max_submission_age_for_start_tracking=timedelta(0, 10*60),
-                    tracked_submissions_limit=10):
-        self.subreddit_name = subreddit_name
-        self.reddit = reddit.Reddit('REDDITEYE -- version alpha')
-        self.reddit.login(user='redditeye', password='redditeye')
-        self.r_subreddit = self.reddit.get_subreddit(subreddit_name)
-        self.subreddit = self.process_subreddit(self.r_subreddit)
-        
-        self.min_submission_tracking_time = min_submission_tracking_time
-        self.reddit_request_interval = reddit_request_interval
-        self.max_submission_age_for_start_tracking = max_submission_age_for_start_tracking
-        self.tracked_submissions_limit = tracked_submissions_limit
-        #self.initial_tracked_submissions = self._initial_tracked_submissions()
     
-    def process_subreddit(self, r_subreddit):
-        raise Exception()
+def flatten_to_seconds(timedel):
+    return timedel.seconds + timedel.days * 86400
 
-    def _initial_tracked_submissions(self, trial_id):
-        """ 
-        Make Submission objects
+def log(string):
+    print string
 
+def PrintDatums():
+    datums = db.SubmissionDatums.find({'r_content_id':'t3_o0r3l'})
+    output_submission_datums(datums)
 
-        This is arbitrary, but mainly we want to:
-            -exclude any submissions we are already tracking
-            -exclude any submissions older than a few minutes
-            -keep the number of tracked items to a minimum at first
-        """
-
-        tracked_submissions = []
-        new_subs = self.r_subreddit.get_new()
-        for r_sub in new_subs:
-            created_on = datetime.fromtimestamp(r_sub.created)
-            if datetime.now() - created_on < self.max_submission_age_for_start_tracking:
-                self.init_submission(r_sub, trial_id)
-            else:
-                pass
-
-    def init_submission(self, r_sub, now, trial_id, position_hot, position_top, position_new):
-        submission = self.db.Submission()
-        submission.r_content_id = r_sub.content_id
-        submission.r_id = r_sub.id
-        submission.author = r_sub.author.user_name
-        submission.title = r_sub.title
-        submission.selftext = r_sub.selftext
-        submission.submission_date = datetime.fromtimestamp(r_sub.created)
-        submission.submission_date_utc = datetime.fromtimestamp(r_sub.created_utc)
-        submission.subreddit_name = self.subreddit.name
-        submission.tracking = True
-        submission.tracking_start_date = now
-        submission.url = r_sub.url
-        submission.is_self = r_sub.is_self
-        submission._trialid = trial_id
-        submission.save()
-        
-
-        sdatum = self.db.SubmissionDatum()
-        sdatum.submission = submission._id
-         
-        sdatum.r_content_id = r_sub.content_id
-        sdatum.r_id = r_sub.id
-        sdatum.comment_count = r_sub.num_comments
-        sdatum.upvotes = r_sub.ups
-        sdatum.downvowes = r_sub.downs
-        sdatum.fetch_date = now
-        sdatum.position_hot = position_hot
-        sdatum.position_top = position_top
-        sdatum.position_new = position_new
-        sdatum.save()
+def Test():
+    trial = MultipleSubmissionTrial('AskReddit', db, tracked_submissions_limit=50)
 
 
-        #make initial comments and commentdatums
-        
-
-    def init_comments(self, r_sub):
-        """
-        class Comment(Document):
-            structure = {
-                'r_submission_id' : ObjectID,
-                'author' : unicode,
-                'r_parent_id' : unicode,
-                'content_id':unicode,
-                'comment_date' : datetime,
-                'depth' : int,
-                'permalink':unicode
-             }
-        """
-        for r_comment in r_sub.comments:
-            comment = self.db.Comment()
-            comment.r_submission_id = r_sub.content_id
-            comment.r_parent_id = r_comment.parent_id
-            comment.content_id = r_comment.content_id
-            comment.created = datetime.fromtimestamp(r_comment.created)
-            comment.created_utc = datetime.fromtimestamp(r_comment.created_utc)
-            comment.depth = 0
-
-            """
-            PROBLEM: CAN'T GET CHILDREN
-
-            """
-
-    """Assume r_comment has already been processed"""
-    def _init_comments(self, r_comment):
-        pass
-    
-    
-    def make_comment_datum(self, r_comment, now):
-        comment = None
-        raise Exception()
-        return comment
-
-    """ Initialize Trial in db """
-    def begin(self):
-        """
-        'trialid' : int,
-        'startdate' : datetime,
-        'finishdate' : datetime,
-        'min_submission_track_minutes' : int,"""
-
-        self.trialid = random.randint(10000000)
-        
-        if min_submission_tracking_time is None:
-            self.min_submission_tracking_time = _MIN_SUBMISSION_TRACKING_TIME 
-        
-        if reddit_request_interval is None:
-            self.reddit_request_interval = _REDDIT_REQUEST_INTERVAL 
-        
-        self.reddit
-
-        trial = db.Trial()
-        trial.trialid = self.trialid
-        trial.startdate = datetime.now()
-        trial.min_submission_track_minutes =  self.min_submission_tracking_time.minutes
-        trial.save()
-        
-        
-        
-        self.start_loop()
-
-    def start_loop(self):
-        #main fetching loop (continue until not tracking any submissions)
-        tracked_submissions = get_tracked_submissions(self.db, subreddit, self.trialid)
-        while tracked_submissions: 
-            for sub in tracked_submissions:
-                if last_context_update - datetime.now() > context_expiry_interval:
-                    last_context_update_date = datetime.now()
-                    #process_context(context_data, last_context_update)
-                    results =  make_contexts(self.db, self.r_subreddit, tracked_submissions):
-                    hot_context, top_context, newsort_context, existing_sub_datums = results
-
-                new_sub_data = fetch_submission(sub.url)
-                sub = process_submission(new_sub_data, context)
-                if datetime.now() - sub.tracking_start_date > self.min_submission_tracking_time:
-                    if self.is_activity_dead(sub):
-                        sub.tracking = false
-                        sub.save()
-                        tracked_submissions.remove(sub)
-            #tracked_submissions = fetch_tracked_submissions(self.db, subreddit, self.trialid)
-
-    def is_submission_dead(self, submission):
-        raise Exception()
-    """ Creates a SubredditContext and a list of SubmissionDatums """
-    def make_contexts(db, r_subreddit, tracked_submissions):
-           
-        hot_subs, top_subs, newsort_subs = None, None, None
-        hot_context, top_subs, newsort_subs = None, None, None,
-        
-        d_tracked_sub_ids = {}
-        [(d_tracked_sub_ids[sub_id] = sub_id) for sub_id in tracked_submissions]
-
-        existing_subs_datums = {}
-        for sort_type in SubmissionSortTypes.get_list():
-            if sort_type == SubmissionSortType.HOT:
-                hot_subs = r_subreddit.get_hot()
-                 
-                hot_context = db.SubredditContext()
-                hot_context.fetch_date = datetime.now()
-                hot_context.sort_type = sort_type
-                hot_context.submissions = None
-                hot_context.save()
-                
-                for i in xrange(len(hot_subs)):
-                    sub = hot_subs[i]
-                    sub_datum_ids = []
-                    if sub.content_id in existing_sub_datums:
-                        sub_datum = existing_sub_datums[sub.content_id]
-                        sub_datum.position_hot = i
-                        sub_datum_ids.append(sub_datum.r_content_id)
-                        sub_datum.save()
-                    else:
-                        #don't make datums for not-tracked submissions
-                        if sub.content_id in d_tracked_sub_ids:
-                            sub_datum = make_submission_datum(sub, position_hot = i)
-                            sub_datum_ids.append(sub_datum.r_content_id)
-                            existing_sub_datums[sub.content_id] = sub.content_id
-                    
-                    hot_context.submissions = sub_datum_ids
-                    hot_context.save()
-                hot_subs = None
-                hot_context = None
-            if sort_type == SubmissionSortType.TOP:
-                top_subs = r_subreddit.get_top()
-                 
-                top_context = db.SubredditContext()
-                top_context.fetch_date = datetime.now()
-                top_context.sort_type = sort_type
-                top_context.submissions = None
-                top_context.save()
-                
-                for i in xrange(len(hot_subs)):
-                    sub = top_subs[i]
-                    sub_datum_ids = []
-                    if sub.content_id in existing_sub_datums:
-                        sub_datum = existing_sub_datums[sub.content_id]
-                        sub_datum.position_top = i
-                        sub_datum_ids.append(sub_datum.r_content_id)
-                        sub_datum.save()
-                    else:
-                        #don't make datums for not-tracked submissions
-                        if sub.content_id in d_tracked_sub_ids:
-                            sub_datum = make_submission_datum(sub, position_top = i)
-                            sub_datum_ids.append(sub_datum.r_content_id)
-                            existing_sub_datums[sub.content_id] = sub.content_id
-                    
-                    top_context.submissions = sub_datum_ids
-                    top_context.save()
-            if sort_type == SubmissionSortType.NEW:
-                newsort_subs = r_subreddit.get_new()
-                 
-                newsort_context = db.SubredditContext()
-                newsort_context.fetch_date = datetime.now()
-                newsort_context.sort_type = sort_type
-                newsort_context.submissions = None
-                newsort_context.save()
-                
-                for i in xrange(len(hot_subs)):
-                    sub = newsort_subs[i]
-                    sub_datum_ids = []
-                    if sub.content_id in existing_sub_datums:
-                        sub_datum = existing_sub_datums[sub.content_id]
-                        sub_datum.position_new = i
-                        sub_datum_ids.append(sub_datum.r_content_id)
-                        sub_datum.save()
-                    else:
-                        #don't make datums for not-tracked submissions
-                        if sub.content_id in d_tracked_sub_ids:
-                            sub_datum = make_submission_datum(sub, position_new = i)
-                            sub_datum_ids.append(sub_datum.r_content_id)
-                            existing_sub_datums[sub.content_id] = sub.content_id
-                    
-                    newsort_context.submissions = sub_datum_ids
-                    newsort_context.save()
-
-        return hot_context, top_context, newsort_context, existing_sub_datums
-
-                
-    def make_submission_datum(self, r_sub, position_hot = None, position_top = None, position_new = None):
-        sub_datum = db.SubmissionDatum()
-        sub_datum.comment_count = r_sub.num_comments
-        sub_datum.upvotes = r_sub.ups
-        sub_datum.downvotes = r_sub.downs
-        sub_datum.r_content_id = r_sub.content_id
-        sub_datum.fetch_date = datetime.now()
-        sub_datum.id = r_sub.r_id
-        
-        if position_hot:
-            sub_datum.position_hot = position_hot
-        if position_top:
-            sub_datum.position_top = position_top
-        if position_new:
-            sub_datum.position_new = position_new
-        
-        sub_datum.save()
-        return sub_datum 
-
-def get_tracked_submissions(db, trialid):
-    return db.Submission.find({'tracking': true, '_trialid':trialid})
-
-"""Returns a list of reddit submission objects, as returned by the reddit api"""
-def fetch_context(subreddit_conn):
-    return subreddit_conn
+def Run():
+    Test()
 
 
 
-    
-    
-    
-    
 
 
-
-    
+if __name__ == "__main__":
+    Run()
 
 
 

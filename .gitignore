@@ -1,7 +1,0 @@
-tags
-.coverage
-*.pyc
-*~
-build/
-dist/
-reddit.egg-info/
