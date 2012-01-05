@@ -9,17 +9,52 @@ from pymongo import Connection
 import pdb
 import lib.reddit as reddit
 
-
-import socks
-import socket
-socks.setdefaultproxy(socks.PROXY_TYPE_SOCKS5, "127.0.0.1", 33016)
-socket.socket = socks.socksocket
-
+import httplib
 import urllib2
-#proxy  = urllib2.ProxyHandler({'http':'127.0.0.1:33016'})
-opener = urllib2.build_opener()
-print opener.open('http://check.torproject.org/').read()
-exit()
+import socks
+
+#import socks
+#import socket
+#import urllib2
+#socks.setdefaultproxy(socks.PROXY_TYPE_SOCKS5, "127.0.0.1", 33016)
+#socket.socket = socks.socksocket
+#opener = urllib2.build_opener()
+#print opener.open('http://check.torproject.org/').read()
+#exit()
+
+
+class SocksiPyConnection(httplib.HTTPConnection):
+    def __init__(self, proxytype, proxyaddr, proxyport = None, rdns = True, username = None, password = None, *args, **kwargs):
+        self.proxyargs = (proxytype, proxyaddr, proxyport, rdns, username, password)
+        httplib.HTTPConnection.__init__(self, *args, **kwargs)
+    def connect(self):
+        self.sock = socks.socksocket()
+        self.sock.setproxy(*self.proxyargs)
+        if isinstance(self.timeout, float):
+            self.sock.settimeout(self.timeout)
+        self.sock.connect((self.host, self.port))
+
+class SocksiPyHandler(urllib2.HTTPHandler):
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kw = kwargs
+        urllib2.HTTPHandler.__init__(self)
+ 
+    def http_open(self, req):
+        def build(host, port=None, strict=None, timeout=0):
+            conn = SocksiPyConnection(*self.args, host=host, port=port, strict=strict, timeout=timeout, **self.kw)
+            return conn
+        return self.do_open(build, req)
+
+    
+#import socks
+#import socket
+#socks_proxy_port = 33016
+#opener = urllib2.build_opener(SocksiPyHandler(socks.PROXY_TYPE_SOCKS4, 'localhost', socks_proxy_port))
+#print opener.open('http://check.torproject.org/').read()
+#exit()
+
+
 """
 3. During an update of the list of tracked submissions:
     --Fetch the context (ie. the ordering of other submissions in the subreddit) and create a cached version of SubredditContext object
@@ -82,32 +117,36 @@ class SocksiPyHandler(urllib2.HTTPHandler):
             return conn
         return self.do_open(build, req)
 
-class RedditTrial(RedditTrial):
+class RedditTrial:
     NUM_SUBMISSIONS_TO_FETCH = 50
-    MIN_SUBMISSION_TRACKING_TIME = timedelta(0,2*60*60),
-    REDDIT_REQUEST_INTERVAL = timedelta(0, 10*60),
-    MAX_SUBMISSION_AGE_FOR_START_TRACKING = timedelta(0, 60*60),
+    #MIN_SUBMISSION_TRACKING_TIME = timedelta(0,2*60*60)
+    REDDIT_REQUEST_INTERVAL = timedelta(0, 60)
+    MAX_SUBMISSION_AGE_FOR_START_TRACKING = timedelta(0, 5*60)
     TRACKED_SUBMISSIONS_LIMIT = 10
+    SOCKS_PROXY_PORT = 33016
     
-    def __init__(self, subreddit_name, db)
+    def __init__(self, subreddit_name, db):
         self.db = db
         self.subreddit_name = subreddit_name
-        self.reddit = reddit.Reddit('REDDITEYE -- version alpha')
+
+        proxy_handler = SocksiPyHandler(socks.PROXY_TYPE_SOCKS4, 'localhost', self.SOCKS_PROXY_PORT)
+        #self.reddit = reddit.Reddit('REDDITEYE -- version alpha', opener)
+        self.reddit = reddit.Reddit('REDDITEYE -- version alpha', proxy_handler=proxy_handler)
 
         self.subreddit = self.reddit.get_subreddit(subreddit_name)
         log('subreddit retrieved...')
 
-        self.timer = MinRequestTime(timedelta(0,30))  #one minute
-        self._init_trial()
-        self._refresh_subreddit()
-        self._choose_tracked_submissions()
+        self.timer = MinRequestTime(self.REDDIT_REQUEST_INTERVAL)
+        self.init_trial()
+        self.refresh_subreddit()
+        self.select_tracked_submissions()
         
         self.start_loop()
 
-    def _refresh_trial(self):
+    def refresh_trial(self):
         self.trial = db.Trials.find_one({'_id' : self.trial_oid})
 
-    def _start_tracking_submission(self, r_submission):
+    def start_tracking_submission(self, r_sub):
         #not sure why but each time we're getting different types for r_sub.author
         if type(r_sub.author) == unicode:
             name = r_sub.author
@@ -129,18 +168,18 @@ class RedditTrial(RedditTrial):
             'is_self' : r_sub.is_self
         } 
         
-        #self._refresh_trial()
+        #self.refresh_trial()
         db.Trials.update({'_id' : self.trial_oid}, {'$push' : {'submissions': s}})
-        db.save()
 
+        log('Starting tracking of: %s' % s['title'])
         return s
 
 
-    def _stop_tracking_submission(self, content_id):
+    def stop_tracking_submission(self, content_id):
         db.Trials.update({'_id' : self.trial_oid}, {'$pull' : {'submissions' : {'r_content_id': content_id}}})
 
 
-    def _refresh_subreddit(self):
+    def refresh_subreddit(self):
         self.r_subreddit = self.reddit.get_subreddit(self.subreddit_name)
         sr = db.SubReddits.find_one({'name':self.subreddit_name})
         if sr:
@@ -150,29 +189,31 @@ class RedditTrial(RedditTrial):
             db.SubReddits.insert(sr)
             self.subreddit = sr
     
-    def _select_tracked_submissions(self):
-        self._refresh_trial()
-        _submissions = self.trial['submissions']
+    def select_tracked_submissions(self):
+        self.refresh_trial()
         
-        subs = [] + _submissions
-        if len(submissions) >= self.self.tracked_submissions_limit:
+        if 'submissions' in self.trial:
+            submissions = self.trial['submissions']
+        else:
+            submissions = []
+        
+        subs = [] + submissions
+        if len(submissions) >= self.TRACKED_SUBMISSIONS_LIMIT:
             return
 
         new_subs = self.r_subreddit.get_new()
         for r_sub in new_subs:
             created_on = datetime.fromtimestamp(r_sub.created)
-            if datetime.now() - created_on < self.max_submission_age_for_start_tracking:
-                log('tracking submission: %s' % r_sub.title)
-                sub = self._start_tracking_submission(r_sub)
+            if datetime.now() - created_on < self.MAX_SUBMISSION_AGE_FOR_START_TRACKING:
+                sub = self.start_tracking_submission(r_sub)
                 subs.append(sub)
-                if len(subs) >= self.tracked_submissions_limit:
+                if len(subs) >= self.TRACKED_SUBMISSIONS_LIMIT:
                     break
     
-    def _init_trial(self):
+    def init_trial(self):
         t = {
             'startdate' : datetime.now(),
             'finishdate' : None,
-            'min_submission_track_seconds' : flatten_to_seconds(self.min_submission_tracking_time),
         }
 
         self.trial_oid = db.Trials.insert(t)
@@ -182,18 +223,18 @@ class RedditTrial(RedditTrial):
     # MAIN LOOP
     #
     def start_loop(self):
-        self.tracked_submissions = self._get_tracked_submissions()
         log('Starting monitoring.')
-         
+        tracked_submissions = self.get_tracked_submissions()
+        
         #main fetching loop (continue until not tracking any submissions)
-        while self.tracked_submissions:
-            self._select_tracked_submissions()
-            self.reset_subreddit()
+        while tracked_submissions:
+            self.select_tracked_submissions()
+            self.refresh_subreddit()
 
             log('fetching update at %s...' % str(datetime.now()))
-            self.process_submissions()
+            self.process_submissions(tracked_submissions)
             
-            self.tracked_submissions = self._get_tracked_submissions()
+            tracked_submissions = self.get_tracked_submissions()
             self.timer.Wait()
         print 'DONE!'
    
@@ -204,13 +245,13 @@ class RedditTrial(RedditTrial):
             for r_comment in sub.all_comments:
                 comment = make_comment_datum(self, r_sub, r_comment)
 
-    def _process_submissions(self):
-        _limit = self._NUM_SUBMISSIONS_TO_FETCH
+    def process_submissions(self, tracked_submissions):
+        _limit = self.NUM_SUBMISSIONS_TO_FETCH
         top_rsubs = list(self.r_subreddit.get_top(limit=_limit))
         hot_rsubs = list(self.r_subreddit.get_hot(limit=_limit))
         new_rsubs = list(self.r_subreddit.get_new(limit=_limit))
         
-        for sub in self.tracked_submissions:
+        for sub in tracked_submissions:
             log('processing submission: %s' % sub['title'])
             if not sub['tracking']: continue
             top_pos, hot_pos, new_pos = -1, -1, -1
@@ -241,8 +282,8 @@ class RedditTrial(RedditTrial):
 
             self.make_submission_datum(rsub, hot_pos, top_pos, new_pos)
 
-    def _get_tracked_submissions(self):
-        self._refresh_trial()
+    def get_tracked_submissions(self):
+        self.refresh_trial()
         subs = self.trial['submissions']
         return filter(lambda sub: sub['tracking'] or sub['tracking_comments'], subs)
 
@@ -346,7 +387,7 @@ def PrintDatums():
     output_submission_datums(datums)
 
 def Test():
-    trial = MultipleSubmissionTrial('AskReddit', db<F2>)
+    trial = RedditTrial('AskReddit', db)
 
 
 def Run():
