@@ -4,14 +4,16 @@ from datetime import datetime
 from datetime import timedelta
 from pdb import set_trace as bp
 
+import sys
+import httplib
+import urllib2
+import socks
+
 import pymongo
 from pymongo import Connection
 import pdb
 import lib.reddit as reddit
 
-import httplib
-import urllib2
-import socks
 
 #import socks
 #import socket
@@ -46,43 +48,12 @@ class SocksiPyHandler(urllib2.HTTPHandler):
             return conn
         return self.do_open(build, req)
 
-    
 #import socks
 #import socket
 #socks_proxy_port = 33016
 #opener = urllib2.build_opener(SocksiPyHandler(socks.PROXY_TYPE_SOCKS4, 'localhost', socks_proxy_port))
 #print opener.open('http://check.torproject.org/').read()
 #exit()
-
-
-"""
-3. During an update of the list of tracked submissions:
-    --Fetch the context (ie. the ordering of other submissions in the subreddit) and create a cached version of SubredditContext object
-    --Fetch the next submission and all comments
-    --Create SubmissionDatums and CommentDatums
-    --If the heuristically calculated activity level of the submission falls below a threshold, disable tracking for that submission
-    --Update the cached SubredditContext once every time interval t
-"""
-
-"""
--=Update Loop Pseudocode=-
-MIN_TRACKING_TIME = timespan(24,0,0)
-tracked_submissions = get_tracked_submissions(subreddit)
-last_context_update = datetime.now()
-context_expiry_interval = timespan(0,0,10)
-
-for sub in tracked_submissions:
-    if last_context_update - datetime.now() > context_expiry_interval:
-        context = fetch_context(subreddit)
-        last_context_update = datetime.now()
-    new_sub_data = fetch_submission(sub.url)
-    sub = process_submission(new_sub_data)
-    if datetime.now() - sub.tracking_start_date > MIN_TRACKING_TIME:
-        if is_activity_is_dead(sub):
-            sub.tracking = false
-            sub.save()
-"""
-
 
 #init mongoDB
 dbname = 'redditeye'
@@ -92,7 +63,6 @@ db = conn[dbname]
 #db.drop_collection('Trials')
 #db.drop_collection('SubmissionDatums')
 #db.drop_collection('SubReddits')
-
 
 class SocksiPyConnection(httplib.HTTPConnection):
     def __init__(self, proxytype, proxyaddr, proxyport = None, rdns = True, username = None, password = None, *args, **kwargs):
@@ -123,7 +93,7 @@ class RedditTrial:
     REDDIT_REQUEST_INTERVAL = timedelta(0, 60)
     MAX_SUBMISSION_AGE_FOR_START_TRACKING = timedelta(0, 5*60)
     TRACKED_SUBMISSIONS_LIMIT = 10
-    SOCKS_PROXY_PORT = 33016
+    SOCKS_PROXY_PORT = 9050
     
     def __init__(self, subreddit_name, db):
         self.db = db
@@ -145,6 +115,14 @@ class RedditTrial:
 
     def refresh_trial(self):
         self.trial = db.Trials.find_one({'_id' : self.trial_oid})
+
+    def is_submission_tracked(self, r_content_id):
+        self.refresh_trial()
+
+        matched_subs = filter(lambda sub: sub['r_content_id'] == r_content_id, self.trial['submissions'])
+        if matched_subs:
+            return True
+        return False
 
     def start_tracking_submission(self, r_sub):
         #not sure why but each time we're getting different types for r_sub.author
@@ -205,15 +183,18 @@ class RedditTrial:
         for r_sub in new_subs:
             created_on = datetime.fromtimestamp(r_sub.created)
             if datetime.now() - created_on < self.MAX_SUBMISSION_AGE_FOR_START_TRACKING:
-                sub = self.start_tracking_submission(r_sub)
-                subs.append(sub)
-                if len(subs) >= self.TRACKED_SUBMISSIONS_LIMIT:
-                    break
+
+                if not self.is_submission_tracked(r_sub.content_id):
+                    sub = self.start_tracking_submission(r_sub)
+                    subs.append(sub)
+                    if len(subs) >= self.TRACKED_SUBMISSIONS_LIMIT:
+                        break
     
     def init_trial(self):
         t = {
             'startdate' : datetime.now(),
             'finishdate' : None,
+            'submissions' : [],
         }
 
         self.trial_oid = db.Trials.insert(t)

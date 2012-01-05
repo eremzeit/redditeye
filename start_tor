@@ -1,0 +1,15 @@
+#!/bin/bash
+
+# Create data directory if it doesn't exist
+if [ ! -d "data" ]; then
+    mkdir "data"
+fi
+ 
+if [ ! -d "data/tor_single" ]; then
+	echo "Creating directory data/tor_single"
+	mkdir "data/tor_single"
+fi
+    # Take into account that authentication for the control port is disabled. Must be used in secure and controlled environments
+    echo "Running: tor --RunAsDaemon 1 --CookieAuthentication 0 --HashedControlPassword \"\" --ControlPort $control_port --PidFile tor$i.pid --SocksPort $socks_port --DataDirectory data/tor$i"
+ 
+tor --RunAsDaemon 1 --CookieAuthentication 0 --HashedControlPassword "" --ControlPort 8118 --PidFile tor0.pid --SocksPort 9050 --DataDirectory data/tor_single
