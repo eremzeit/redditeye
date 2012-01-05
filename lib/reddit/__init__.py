@@ -122,7 +122,7 @@ class BaseReddit(object):
     """The base class for a reddit session."""
     DEFAULT_HEADERS = {}
 
-    def __init__(self, user_agent, site_name=None):
+    def __init__(self, user_agent, site_name=None, proxy_handler=None):
         """
         Specify the user agent for the application and optionally a site_name.
 
@@ -137,8 +137,11 @@ class BaseReddit(object):
         self.config = Config(site_name or os.getenv('REDDIT_SITE') or 'reddit')
 
         _cookie_jar = cookielib.CookieJar()
-        self._opener = urllib2.build_opener(
-            urllib2.HTTPCookieProcessor(_cookie_jar))
+        
+        opener_args = [urllib2.HTTPCookieProcessor(_cookie_jar)]
+        if proxy_handler:
+            opener_args.append(proxy_handler)
+        self._opener = urllib2.build_opener(*opener_args)
 
         self.modhash = self.user = None
 
